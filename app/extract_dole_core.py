@@ -319,12 +319,32 @@ def _extract_bultos_total(text):
     return None
 
 
+def _extract_proveedor_from_filename(filename):
+    """Toma las primeras palabras del nombre de archivo, antes de llegar a
+    un codigo de puerto (FPO/GPT/ILG) o una palabra clave tipo FACT/PHYTO,
+    como mejor intento de proveedor. Es el fallback mas confiable cuando NO
+    hay estructura de carpetas disponible (ej. estamos procesando archivos
+    ya aplanados por /process-email, donde se perdio el path original)."""
+    nombre = os.path.splitext(os.path.basename(filename))[0]
+    palabras = nombre.replace('#', ' ').split()
+    detener_en = {'FPO', 'GPT', 'ILG', 'FACT', 'FACTURA', 'PHYTO', 'ORG', 'BANANAS', 'BB', 'ACT'}
+    resultado = []
+    for palabra in palabras:
+        if palabra.upper() in detener_en or re.match(r'^\d', palabra):
+            break
+        resultado.append(palabra)
+    texto = ' '.join(resultado).upper().strip()
+    return texto if texto else "???"
+
+
 def _extract_proveedor_from_path(path, text=""):
-    """El proveedor se detecta primero por CONTENIDO (más confiable: las
-    facturas UBESA a veces llegan sueltas, sin ninguna subcarpeta "UBESA/"
-    que las identifique — ej. el correo con "ECFPOFACTURA...INV6750.xls"
-    directo en la raíz). Si el contenido no lo delata, se cae a la carpeta
-    contenedora (ej. .../OTROS EXPORTADORES/LUDERSON/archivo.pdf → LUDERSON)."""
+    """El proveedor se detecta en este orden (de mas a menos confiable):
+    1) CONTENIDO del documento (ej. "UNION DE BANANEROS ECUATORIANOS" -> UBESA)
+    2) La carpeta contenedora, SI existe una carpeta real de exportador
+       (ej. .../OTROS EXPORTADORES/LUDERSON/archivo.pdf -> LUDERSON)
+    3) El propio NOMBRE DE ARCHIVO -- necesario cuando el archivo ya viene
+       suelto, sin ninguna carpeta que lo identifique (ej. procesado via
+       /process-email, donde ya no existe el path original)."""
     upper_text = text.upper()
     if 'UNION DE BANANEROS ECUATORIANOS' in upper_text or 'UBESA' in upper_text:
         return 'UBESA'
@@ -332,15 +352,17 @@ def _extract_proveedor_from_path(path, text=""):
     parts = [p.upper() for p in os.path.normpath(path).split(os.sep)]
     if 'UBESA' in parts:
         return 'UBESA'
-    # También suele venir en el propio nombre de archivo (ej. "ECFPOFACTURA...")
     fname_upper = os.path.basename(path).upper()
     if fname_upper.startswith('EC') and 'FACTURA' in fname_upper:
         return 'UBESA'
 
     parent = os.path.basename(os.path.dirname(path)).upper().strip()
-    if parent and 'OTROS EXPORTADORES' not in parent:
+    carpetas_no_validas = ('OTROS EXPORTADORES', '', 'TMP') 
+    es_carpeta_temporal = parent.startswith('OCR_DOLE_BATCH') or parent.startswith('/TMP')
+    if parent and parent not in carpetas_no_validas and not es_carpeta_temporal:
         return parent
-    return "???"
+
+    return _extract_proveedor_from_filename(path)
 
 
 def extract_fito(path):
@@ -359,8 +381,9 @@ def extract_fito(path):
     containers = _extract_containers_list(text)
     item = "PLATANO" if ("PLATANO" in upper or "PLANTAIN" in upper
                          or "PLANT" in os.path.basename(path).upper()) else "BANANO"
+    proveedor = _extract_proveedor_from_path(path, text)
 
-    return {"number": number, "bultos": bultos, "containers": containers, "item": item}
+    return {"number": number, "bultos": bultos, "containers": containers, "item": item, "proveedor": proveedor}
 
 # ─────────────────────────────────────────────
 # Extracción FACTURA

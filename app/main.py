@@ -60,6 +60,91 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/process-email")
+async def process_email_endpoint(
+    file: UploadFile = File(..., description="El adjunto crudo del correo (zip con o sin anidados, o un archivo suelto)"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    El endpoint 'todo en uno' para n8n: recibe el adjunto TAL CUAL viene del
+    correo y hace todo el trabajo de clasificacion del lado de Python:
+
+      1. Desempaca (flatten_zip_bytes) -- zips anidados a cualquier profundidad.
+      2. Entre los archivos resultantes, identifica el PDF de ~100 BLs (si
+         viene en este correo) y lo divide pagina por pagina.
+      3. Cualquier otro archivo lo clasifica (factura/fito/manifiesto/marchamos)
+         y le extrae sus datos.
+
+    n8n ya no necesita decidir "es el PDF de BLs?" ni hacer una llamada HTTP
+    por archivo -- solo llama esto UNA vez por correo, y con el JSON que
+    regresa arma las carpetas, sube los PDFs y llena el Excel. Python nunca
+    toca Drive ni Sheets.
+    """
+    check_api_key(x_api_key)
+    content = await file.read()
+
+    try:
+        archivos = flatten_zip_bytes(file.filename, content)
+    except Exception as e:
+        return JSONResponse(status_code=422, content={"error": f"No se pudo procesar el adjunto: {e}"})
+
+    bls = []
+    documentos = []
+    advertencias = []
+
+    for archivo in archivos:
+        fname = archivo["filename"]
+        data = archivo["content"]
+
+        if re.match(r'^BLS|VIA PQU', fname, re.IGNORECASE):
+            try:
+                paginas = split_bl_pdf_pages(data)
+            except Exception as e:
+                advertencias.append(f"{fname}: no se pudo dividir el PDF de BLs ({e})")
+                continue
+
+            for p in paginas:
+                if p["warning"]:
+                    advertencias.append(p["warning"])
+                for campo in ("gyeprq", "contenedor", "destino", "tipo"):
+                    if p[campo] == "???":
+                        advertencias.append(f"{fname} pagina {p['pagina']}: no se encontro {campo}")
+
+                nombre_base = p["gyeprq"] if p["gyeprq"] != "???" else f"SIN_CODIGO_pagina_{p['pagina']}"
+                bls.append({
+                    "gyeprq": p["gyeprq"],
+                    "contenedor": p["contenedor"],
+                    "destino": p["destino"],
+                    "tipo": p["tipo"],
+                    "filename": f"{nombre_base}.pdf",
+                    "pdf_base64": base64.b64encode(p["pdf_bytes"]).decode("ascii"),
+                })
+            continue
+
+        tmp_dir = tempfile.mkdtemp(prefix="ocr_dole_batch_")
+        tmp_path = os.path.join(tmp_dir, fname)
+        try:
+            with open(tmp_path, "wb") as fh:
+                fh.write(data)
+            resultado = classify_single_document(tmp_path)
+        except Exception as e:
+            resultado = {"tipo": "DESCONOCIDO", "motivo": f"error inesperado: {e}"}
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        resultado["filename"] = fname
+        resultado["content_base64"] = base64.b64encode(data).decode("ascii")
+        documentos.append(resultado)
+
+    return {
+        "total_bls": len(bls),
+        "bls": bls,
+        "total_documentos": len(documentos),
+        "documentos": documentos,
+        "advertencias": advertencias,
+    }
+
+
 @app.post("/flatten-attachment")
 async def flatten_attachment_endpoint(
     file: UploadFile = File(..., description="El adjunto del correo -- puede ser un zip (con zips anidados adentro) o un archivo suelto"),
