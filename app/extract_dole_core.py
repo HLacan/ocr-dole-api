@@ -73,16 +73,30 @@ def _ocr_pdf(path):
         import pytesseract
         from PIL import Image
         import io
+        import gc
+
         doc = fitz.open(path)
         parts = []
         for page in doc:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            # 150 dpi en vez de 200: sigue siendo suficiente para que
+            # tesseract lea bien estos certificados, pero usa bastante
+            # menos memoria por pagina (la relacion es cuadratica con el
+            # dpi) -- importante en hostings con poca RAM (ej. 512MB).
+            pix = page.get_pixmap(dpi=150)
+            png_bytes = pix.tobytes("png")
+            pix = None  # liberar el pixmap nativo cuanto antes
+
+            img = Image.open(io.BytesIO(png_bytes))
             try:
                 parts.append(pytesseract.image_to_string(img, lang="eng+spa"))
             except Exception:
-                # el paquete de idioma 'spa' puede no estar instalado
                 parts.append(pytesseract.image_to_string(img, lang="eng"))
+            finally:
+                img.close()
+                del img, png_bytes
+                gc.collect()  # evita que la memoria de esta pagina se acumule sobre la siguiente
+
+        doc.close()
         return "\n".join(parts)
     except Exception:
         return ""
@@ -553,20 +567,25 @@ def build_row(container, bl_data, bl_warning, facturas, fitos, manifiestos):
 # LISTADO DE MARCHAMOS
 # ─────────────────────────────────────────────
 
-def split_bl_pdf_pages(pdf_bytes):
+def split_bl_pdf_pages(pdf_bytes, generar_pdfs=True):
     """
     Version 'API' de split_bl_pdf(): en vez de leer de una ruta y devolver
     solo texto por código, recibe los BYTES del PDF combinado y devuelve,
     por cada página, el PDF de una sola página (bytes) + los datos ya
     extraídos con extract_bl_from_text (misma lógica ya validada).
 
+    generar_pdfs=False se salta por completo la generacion de cada PDF
+    individual (PdfWriter + buffer) -- ahorra memoria cuando el llamador
+    de todos modos no va a usar esos bytes (ej. incluir_archivos=false).
+
     Retorna: list of {"gyeprq", "contenedor", "destino", "tipo",
-                       "warning", "pdf_bytes"}
+                       "warning", "pdf_bytes"} (pdf_bytes=None si
+                       generar_pdfs=False)
     """
     import io
     from pypdf import PdfReader, PdfWriter
 
-    reader = PdfReader(io.BytesIO(pdf_bytes))
+    reader = PdfReader(io.BytesIO(pdf_bytes)) if generar_pdfs else None
     resultados = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -577,10 +596,13 @@ def split_bl_pdf_pages(pdf_bytes):
 
             bl_data, warning = extract_bl_from_text(text, code)
 
-            writer = PdfWriter()
-            writer.add_page(reader.pages[i])
-            buf = io.BytesIO()
-            writer.write(buf)
+            pdf_bytes_pagina = None
+            if generar_pdfs:
+                writer = PdfWriter()
+                writer.add_page(reader.pages[i])
+                buf = io.BytesIO()
+                writer.write(buf)
+                pdf_bytes_pagina = buf.getvalue()
 
             resultados.append({
                 "gyeprq": bl_data["BL"],
@@ -589,7 +611,7 @@ def split_bl_pdf_pages(pdf_bytes):
                 "tipo": bl_data["TIPO"],
                 "pagina": i + 1,
                 "warning": warning,
-                "pdf_bytes": buf.getvalue(),
+                "pdf_bytes": pdf_bytes_pagina,
             })
     return resultados
 

@@ -100,7 +100,7 @@ async def process_email_endpoint(
 
         if re.match(r'^BLS|VIA PQU', fname, re.IGNORECASE):
             try:
-                paginas = split_bl_pdf_pages(data)
+                paginas = split_bl_pdf_pages(data, generar_pdfs=incluir_archivos)
             except Exception as e:
                 advertencias.append(f"{fname}: no se pudo dividir el PDF de BLs ({e})")
                 continue
@@ -207,7 +207,7 @@ async def split_bl_pdf_endpoint(
     content = await file.read()
 
     try:
-        paginas = split_bl_pdf_pages(content)
+        paginas = split_bl_pdf_pages(content, generar_pdfs=incluir_archivos)
     except Exception as e:
         return JSONResponse(status_code=422, content={"error": f"No se pudo procesar el PDF: {e}"})
 
