@@ -33,7 +33,7 @@ import time
 import base64
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 from extract_dole_core import (
@@ -63,6 +63,7 @@ def health():
 @app.post("/process-email")
 async def process_email_endpoint(
     file: UploadFile = File(..., description="El adjunto crudo del correo (zip con o sin anidados, o un archivo suelto)"),
+    incluir_archivos: bool = Query(False, description="Si es true, incluye el contenido de cada archivo en base64. Por defecto false: solo el JSON con los datos extraidos."),
     x_api_key: Optional[str] = Header(None),
 ):
     """
@@ -75,10 +76,11 @@ async def process_email_endpoint(
       3. Cualquier otro archivo lo clasifica (factura/fito/manifiesto/marchamos)
          y le extrae sus datos.
 
-    n8n ya no necesita decidir "es el PDF de BLs?" ni hacer una llamada HTTP
-    por archivo -- solo llama esto UNA vez por correo, y con el JSON que
-    regresa arma las carpetas, sube los PDFs y llena el Excel. Python nunca
-    toca Drive ni Sheets.
+    Por defecto (incluir_archivos=false) solo regresa el JSON con los datos
+    extraidos, SIN el contenido de los archivos -- la logica para generar
+    cada PDF individual (y el archivo original de cada documento) sigue
+    intacta, simplemente no se manda en la respuesta a menos que se pida
+    explicitamente con ?incluir_archivos=true.
     """
     check_api_key(x_api_key)
     content = await file.read()
@@ -111,14 +113,16 @@ async def process_email_endpoint(
                         advertencias.append(f"{fname} pagina {p['pagina']}: no se encontro {campo}")
 
                 nombre_base = p["gyeprq"] if p["gyeprq"] != "???" else f"SIN_CODIGO_pagina_{p['pagina']}"
-                bls.append({
+                bl_item = {
                     "gyeprq": p["gyeprq"],
                     "contenedor": p["contenedor"],
                     "destino": p["destino"],
                     "tipo": p["tipo"],
                     "filename": f"{nombre_base}.pdf",
-                    "pdf_base64": base64.b64encode(p["pdf_bytes"]).decode("ascii"),
-                })
+                }
+                if incluir_archivos:
+                    bl_item["pdf_base64"] = base64.b64encode(p["pdf_bytes"]).decode("ascii")
+                bls.append(bl_item)
             continue
 
         tmp_dir = tempfile.mkdtemp(prefix="ocr_dole_batch_")
@@ -133,7 +137,8 @@ async def process_email_endpoint(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         resultado["filename"] = fname
-        resultado["content_base64"] = base64.b64encode(data).decode("ascii")
+        if incluir_archivos:
+            resultado["content_base64"] = base64.b64encode(data).decode("ascii")
         documentos.append(resultado)
 
     return {
@@ -148,6 +153,7 @@ async def process_email_endpoint(
 @app.post("/flatten-attachment")
 async def flatten_attachment_endpoint(
     file: UploadFile = File(..., description="El adjunto del correo -- puede ser un zip (con zips anidados adentro) o un archivo suelto"),
+    incluir_archivos: bool = Query(False, description="Si es true, incluye el contenido de cada archivo en base64. Por defecto false: solo el listado de nombres."),
     x_api_key: Optional[str] = Header(None),
 ):
     """
@@ -157,6 +163,9 @@ async def flatten_attachment_endpoint(
     lista PLANA de archivos reales que contiene, sin importar cuantos
     niveles de zip haya adentro. Ya viene filtrado (sin carpetas, sin
     extensiones que no nos sirven).
+
+    Por defecto no incluye el contenido de cada archivo -- solo con
+    ?incluir_archivos=true se agrega el base64.
     """
     check_api_key(x_api_key)
     content = await file.read()
@@ -166,29 +175,33 @@ async def flatten_attachment_endpoint(
     except Exception as e:
         return JSONResponse(status_code=422, content={"error": f"No se pudo procesar el archivo: {e}"})
 
+    resultado_archivos = []
+    for a in archivos:
+        item = {"filename": a["filename"]}
+        if incluir_archivos:
+            item["content_base64"] = base64.b64encode(a["content"]).decode("ascii")
+        resultado_archivos.append(item)
+
     return {
-        "total_archivos": len(archivos),
-        "archivos": [
-            {
-                "filename": a["filename"],
-                "content_base64": base64.b64encode(a["content"]).decode("ascii"),
-            }
-            for a in archivos
-        ],
+        "total_archivos": len(resultado_archivos),
+        "archivos": resultado_archivos,
     }
 
 
 @app.post("/split-bl-pdf")
 async def split_bl_pdf_endpoint(
     file: UploadFile = File(..., description="El PDF combinado de BLs (1 pagina = 1 BL, ej. ~100 paginas)"),
+    incluir_archivos: bool = Query(False, description="Si es true, incluye el PDF de cada BL en base64. Por defecto false: solo el JSON con los datos extraidos."),
     x_api_key: Optional[str] = Header(None),
 ):
     """
     Divide el PDF de N hojas y devuelve, por cada pagina/BL:
-    gyeprq, contenedor, destino, tipo, filename y el PDF de esa sola
-    pagina en base64. No escribe nada a disco de forma persistente ni
-    toca Drive — n8n decide que hacer con cada resultado (crear carpeta,
-    subir el PDF, escribir la fila en el Excel).
+    gyeprq, contenedor, destino, tipo, filename. No escribe nada a disco
+    de forma persistente ni toca Drive.
+
+    Por defecto no incluye el PDF de cada BL en la respuesta -- la logica
+    para generarlo sigue intacta, solo que no se manda a menos que se pida
+    con ?incluir_archivos=true.
     """
     check_api_key(x_api_key)
     content = await file.read()
@@ -208,14 +221,16 @@ async def split_bl_pdf_endpoint(
                 advertencias.append(f"pagina {p['pagina']}: no se encontro {campo}")
 
         nombre_base = p["gyeprq"] if p["gyeprq"] != "???" else f"SIN_CODIGO_pagina_{p['pagina']}"
-        bls.append({
+        bl_item = {
             "gyeprq": p["gyeprq"],
             "contenedor": p["contenedor"],
             "destino": p["destino"],
             "tipo": p["tipo"],
             "filename": f"{nombre_base}.pdf",
-            "pdf_base64": base64.b64encode(p["pdf_bytes"]).decode("ascii"),
-        })
+        }
+        if incluir_archivos:
+            bl_item["pdf_base64"] = base64.b64encode(p["pdf_bytes"]).decode("ascii")
+        bls.append(bl_item)
 
     return {
         "total_paginas": len(bls),
