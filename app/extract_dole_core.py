@@ -30,10 +30,12 @@ import os, re, sys, argparse, subprocess
 
 def ensure_deps():
     try:
-        import pdfplumber, openpyxl
+        import pdfplumber, openpyxl, fitz, pytesseract
+        from PIL import Image
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install",
-                        "pdfplumber", "openpyxl", "--break-system-packages", "-q"], check=True)
+                        "pdfplumber", "openpyxl", "pymupdf", "pytesseract", "Pillow",
+                        "--break-system-packages", "-q"], check=True)
 ensure_deps()
 
 import pdfplumber
@@ -44,37 +46,98 @@ from openpyxl.utils import get_column_letter
 CONTAINER_RE = re.compile(r'\b([A-Z]{4}[0-9]{7})\b')
 
 # ─────────────────────────────────────────────
-# Clasificación de archivos
+# Extracción de texto — con OCR de respaldo
 # ─────────────────────────────────────────────
+# En la práctica, algunos proveedores (ej. UBESA) generan PDFs con una
+# fuente embebida sin mapa Unicode real: pdfplumber/pymupdf extraen texto
+# corrupto (caracteres de control). Se detecta ese caso y se usa OCR sobre
+# la imagen renderizada de la página como respaldo.
 
-def classify_file(filename):
-    name = filename.upper()
-    base = os.path.splitext(name)[0]
-    ext  = os.path.splitext(name)[1]
-    if 'CONSULTAMANIFIESTO' in name or ('CONSULTA' in name and 'MANIFIESTO' in name):
-        return 'MANIFIESTO'
-    if name.startswith('BLS') or (name.startswith('BL') and 'DPC' in name):
-        return 'BL'
-    if 'FACT' in name and ext == '.PDF':
-        return 'FACTURA'
-    if 'INVOICE' in name and ext == '.PDF':
-        return 'FACTURA'
-    if re.match(r'^EC-UB-\d+', base) and ext == '.PDF':
-        return 'FACTURA'
-    if 'PHYTO' in name or 'FITO' in name:
-        return 'FITO'
-    if re.match(r'^(AA-)?[0-9]+P$', base) and ext == '.PDF':
-        return 'FITO'
-    if 'MANIFIESTO' in name and ext == '.PDF':
-        return 'MANIFIESTO'
-    return 'UNKNOWN'
+def _is_garbled(text):
+    if not text or len(text.strip()) < 20:
+        return True
+    # pdfplumber representa glifos sin mapa Unicode como "(cid:123)" — es un
+    # indicador inequívoco de fuente rota, independiente de si el resto del
+    # texto "parece" imprimible.
+    if text.count('(cid:') >= 3:
+        return True
+    sample = text[:2000]
+    printable = sum(1 for c in sample if c.isprintable() and
+                     (c.isalnum() or c in " .,:;/-()°ºÁÉÍÓÚáéíóúÑñ%$#"))
+    return printable / max(len(sample), 1) < 0.6
+
+
+def _ocr_pdf(path):
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+        import io
+        doc = fitz.open(path)
+        parts = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=200)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                parts.append(pytesseract.image_to_string(img, lang="eng+spa"))
+            except Exception:
+                # el paquete de idioma 'spa' puede no estar instalado
+                parts.append(pytesseract.image_to_string(img, lang="eng"))
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
 
 def pdf_text(path):
     try:
         with pdfplumber.open(path) as pdf:
-            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception:
+        text = ""
+    if _is_garbled(text):
+        ocr_text = _ocr_pdf(path)
+        if ocr_text.strip():
+            return ocr_text
+    return text
+
+
+def xlsx_text(path):
+    """Convierte todas las celdas de un xlsx a texto plano, para poder
+    aplicarle las mismas búsquedas por palabra clave/regex que a un PDF."""
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
     except Exception:
         return ""
+    lines = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(values_only=True):
+            for cell in row:
+                if cell is not None:
+                    lines.append(str(cell))
+    return "\n".join(lines)
+
+
+def doc_text(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.xlsx', '.xlsm', '.xls'):
+        return xlsx_text(path)
+    return pdf_text(path)
+
+# ─────────────────────────────────────────────
+# Clasificación de archivos
+# ─────────────────────────────────────────────
+# Solo BL y MANIFIESTO se clasifican por NOMBRE (es confiable). Facturas y
+# fitos se clasifican por CONTENIDO en classify_and_extract_all(), porque en
+# la práctica los nombres reales no siguen ningún patrón fijo (ej. no todas
+# las facturas UBESA se llaman "EC-UB-*", ni todos los fitos dicen "PHYTO").
+
+def classify_file(filename):
+    name = filename.upper()
+    if 'CONSULTAMANIFIESTO' in name or ('CONSULTA' in name and 'MANIFIESTO' in name):
+        return 'MANIFIESTO'
+    if name.startswith('BLS') or (name.startswith('BL') and 'DPC' in name):
+        return 'BL'
+    return 'UNKNOWN'
 
 def file_mtime(path):
     try: return os.path.getmtime(path)
@@ -194,107 +257,111 @@ def extract_manifiesto(path):
 # Extracción FITO
 # ─────────────────────────────────────────────
 
+def _extract_containers_list(text):
+    """
+    Busca una línea tipo 'CONTAINERS: DFIU1234567-DFIU7654321-...' (varios,
+    típico de facturas/fitos de "otros exportadores" que agrupan varios
+    contenedores) o 'CONTAINER: DFIU1234567' (uno solo, típico de UBESA).
+    Si no hay línea explícita, cae a buscar cualquier código de contenedor
+    presente en todo el documento.
+    """
+    compact = re.sub(r'\s+', '', text.upper())
+    m = re.search(r'CONTAINERS?:([A-Z0-9\-,]+)', compact)
+    if m:
+        codes = re.findall(r'[A-Z]{4}[0-9]{7}', m.group(1))
+        if codes:
+            return codes
+    return [c for c in CONTAINER_RE.findall(text) if not c.startswith('GYE')]
+
+
+def _extract_bultos_total(text):
+    upper = text.upper()
+    # Prioridad 1: facturas en xlsx suelen traer una celda "Cantidad Total: N"
+    m = re.search(r'CANTIDAD\s*TOTAL\s*:?\s*(\d{2,6})', upper)
+    if m:
+        return int(m.group(1))
+    # Prioridad 2: "4800 Box" / "4800 Boxes" (fitos y facturas PDF)
+    m = re.search(r'(\d{2,6})\s*BOX(?:ES)?\b', text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # Prioridad 3: "4800 CAJAS" (plural exacto — "CAJA" singular suele ser
+    # parte de un nombre de producto/código, no una cantidad, y daría falsos
+    # positivos como "6100 CAJA DOLE CONVENCIONAL")
+    m = re.search(r'(\d{2,6})\s*CAJAS\b', upper)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _extract_proveedor_from_path(path):
+    """El nombre del proveedor sale de la carpeta que contiene el archivo
+    (ej. .../OTROS EXPORTADORES/LUDERSON/archivo.pdf → LUDERSON), excepto
+    para UBESA, donde los archivos viven en subcarpetas por destino
+    (FPO/GPT/ILG) dentro de una carpeta UBESA — en ese caso se usa "UBESA"."""
+    parts = [p.upper() for p in os.path.normpath(path).split(os.sep)]
+    if 'UBESA' in parts:
+        return 'UBESA'
+    parent = os.path.basename(os.path.dirname(path)).upper().strip()
+    if parent and 'OTROS EXPORTADORES' not in parent:
+        return parent
+    return "???"
+
+
 def extract_fito(path):
-    """Returns {number, bultos, contenedor}"""
-    fname_base = os.path.splitext(os.path.basename(path))[0]
-    text = pdf_text(path)
+    """Returns {number, bultos, containers, item}"""
+    text = doc_text(path)
+    upper = text.upper()
+    compact = re.sub(r'\s+', '', text)
 
-    # Número de certificado — siempre con prefijo AA-
-    if re.match(r'^(AA-)?[0-9]+P$', fname_base, re.IGNORECASE):
-        num = fname_base.upper()
-        if not num.startswith('AA-'):
-            num = 'AA-' + num
-    else:
-        m = re.search(r'N[°º°]\s*([0-9]{15,}P)', text)
-        num = ('AA-' + m.group(1)) if m else fname_base
+    m = re.search(r'N[°ºo]\.?([0-9]{15,30}P)', compact, re.IGNORECASE)
+    number = m.group(1).upper() if m else None
+    if not number:
+        m2 = re.search(r'([0-9]{15,30}P)\b', compact)
+        number = m2.group(1).upper() if m2 else "???"
 
-    # Bultos
-    bultos = None
-    m = re.search(r'(\d+)\s+Box(?:es)?', text, re.IGNORECASE)
-    if m: bultos = int(m.group(1))
+    bultos = _extract_bultos_total(text)
+    containers = _extract_containers_list(text)
+    item = "PLATANO" if ("PLATANO" in upper or "PLANTAIN" in upper
+                         or "PLANT" in os.path.basename(path).upper()) else "BANANO"
 
-    # Contenedor mencionado en el fito
-    containers = [c for c in CONTAINER_RE.findall(text)
-                  if not c.startswith('GYE') and not c.startswith('AG1')]
-    contenedor = containers[0] if containers else None
-
-    return {"number": num, "bultos": bultos, "contenedor": contenedor}
+    return {"number": number, "bultos": bultos, "containers": containers, "item": item}
 
 # ─────────────────────────────────────────────
 # Extracción FACTURA
 # ─────────────────────────────────────────────
 
 def extract_factura(path):
-    text = pdf_text(path)
-    fname = os.path.basename(path).upper()
-    base  = os.path.splitext(fname)[0]
+    """Returns {proveedor, factura, item, containers, bultos}"""
+    text = doc_text(path)
+    upper = text.upper()
 
-    result = {
-        "proveedor": "???", "factura": "???", "item": "???",
-        "contenedor": "???", "bultos_per_container": {},
-    }
+    proveedor = _extract_proveedor_from_path(path)
 
-    # ── UBESA (EC-UB-XXXX.pdf) — puede listar varios contenedores ──
-    if re.match(r'^EC-UB-', base):
-        result["proveedor"] = "UBESA"
-        result["factura"]   = base
-        result["item"] = "PLATANO" if "PLANTAIN" in text.upper() else "BANANO"
-        for line in text.split('\n'):
-            tokens = line.split()
-            if len(tokens) >= 3 and CONTAINER_RE.match(tokens[0]):
-                cont = tokens[0]
-                try:
-                    boxes = int(tokens[1])
-                    result["bultos_per_container"][cont] = boxes
-                except ValueError:
-                    pass
-        return result
-
-    # ── ASOPEQ / Tierra Fertil ──
-    if ('TIERRA FERTIL' in text.upper()
-            or 'ASOCIACION DE PEQUEÑOS' in text.upper()
-            or 'ASOCIACIÓN' in text.upper()):
-        result["proveedor"] = "ASOPEQ"
-        m = re.search(r'FACTURA\s+([\d\-]+)', text)
-        if m: result["factura"] = m.group(1)
-        result["item"] = "PLATANO" if ("PLATANO" in text.upper() or "PLANTAIN" in text.upper()) else "BANANO"
-        m2 = re.search(r'CONTENEDOR\(es\)\s+([A-Z]{4}[0-9]{7})', text)
-        if m2:
-            result["contenedor"] = m2.group(1)
+    # Número de factura: formato estándar Ecuador (001-002-000000123456),
+    # luego "FACT #1234" / "FACT 1234", luego "No. 123456789..." genérico
+    factura = "???"
+    m = re.search(r'(\d{3}-\d{3}-\d{6,9})', text)
+    if m:
+        factura = m.group(1)
+    else:
+        m = re.search(r'FACT(?:URA)?\.?\s*#?\s*(\d{3,10})', upper)
+        if m:
+            factura = m.group(1)
         else:
-            containers = [c for c in CONTAINER_RE.findall(text)
-                          if not c.startswith('GYE') and not c.startswith('AG1')]
-            if containers: result["contenedor"] = containers[0]
-        m3 = re.search(r'CANTIDAD\s+(\d+)', text)
-        if m3:
-            boxes = int(m3.group(1))
-            if result["contenedor"] != "???":
-                result["bultos_per_container"][result["contenedor"]] = boxes
-        return result
+            m = re.search(r'\bNo\.?\s*[:\-]?\s*(\d{9,15})\b', text)
+            if m:
+                factura = m.group(1)
 
-    # ── Marplantis ──
-    if 'MARPLANTIS' in text.upper():
-        result["proveedor"] = "MARPLANTIS"
-        m = re.search(r'No\.\s*([\d\-]+)', text)
-        if not m: m = re.search(r'(001-\d{3}-\d{8})', text)
-        if m: result["factura"] = m.group(1)
-        result["item"] = "PLATANO" if "PLANTAIN" in text.upper() else "BANANO"
-        m2 = re.search(r'CONTAINER[:\s]+([A-Z]{4}[0-9]{7})', text)
-        if m2: result["contenedor"] = m2.group(1)
-        m3 = re.search(r'(?:Bananas?|Plantains?)\s+(\d+)\s+[\d\.,]+', text, re.IGNORECASE)
-        if m3:
-            boxes = int(m3.group(1))
-            if result["contenedor"] != "???":
-                result["bultos_per_container"][result["contenedor"]] = boxes
-        return result
+    item = "PLATANO" if ("PLATANO" in upper or "PLANTAIN" in upper
+                         or "PLANT" in os.path.basename(path).upper()) else "BANANO"
 
-    # ── Fallback ──
-    m = re.search(r'INVOICE\s+([\w\-]+)', text, re.IGNORECASE)
-    if m: result["factura"] = m.group(1)
-    containers = [c for c in CONTAINER_RE.findall(text)
-                  if not c.startswith('GYE') and not c.startswith('AG1')]
-    if containers: result["contenedor"] = containers[0]
-    return result
+    containers = _extract_containers_list(text)
+    bultos = _extract_bultos_total(text)
+
+    return {
+        "proveedor": proveedor, "factura": factura, "item": item,
+        "containers": containers, "bultos": bultos,
+    }
 
 # ─────────────────────────────────────────────
 # Recorrer TODOS los archivos (sin importar estructura de carpetas)
@@ -303,9 +370,9 @@ def extract_factura(path):
 def classify_and_extract_all(input_folder, exclude_path=None):
     """
     Recorre input_folder recursivamente (sirve tanto si los archivos vienen
-    sueltos como organizados en subcarpetas) y extrae cada factura/fito/
-    manifiesto. exclude_path es el PDF combinado de BLs, que ya se procesó
-    aparte y no debe reclasificarse.
+    sueltos como organizados en subcarpetas) y clasifica/extrae cada
+    factura/fito/manifiesto **por contenido** (los nombres reales no siguen
+    un patrón fijo). Cada archivo se lee una sola vez.
     """
     exclude_abs = os.path.abspath(exclude_path) if exclude_path else None
     facturas, fitos, manifiestos = [], [], []
@@ -314,17 +381,35 @@ def classify_and_extract_all(input_folder, exclude_path=None):
             fpath = os.path.join(root, fname)
             if exclude_abs and os.path.abspath(fpath) == exclude_abs:
                 continue
-            kind = classify_file(fname)
-            if kind == 'FACTURA':
-                fd = extract_factura(fpath)
-                fd['_mtime'] = file_mtime(fpath)
-                facturas.append(fd)
-            elif kind == 'FITO':
+
+            name_upper = fname.upper()
+            ext = os.path.splitext(fname)[1].lower()
+
+            # BL combinado: se procesa aparte, se ignora aquí
+            if name_upper.startswith('BLS') or (name_upper.startswith('BL') and 'DPC' in name_upper):
+                continue
+            # Manifiesto: confiable por nombre
+            if 'CONSULTAMANIFIESTO' in name_upper or ('CONSULTA' in name_upper and 'MANIFIESTO' in name_upper):
+                manifiestos.append({"number": extract_manifiesto(fpath), "_mtime": file_mtime(fpath)})
+                continue
+
+            if ext not in ('.pdf', '.xlsx', '.xlsm', '.xls'):
+                continue
+
+            text = doc_text(fpath)
+            upper = text.upper()
+
+            if 'FITOSANITARIO' in upper or 'PHYTOSANITARY' in upper:
                 fi = extract_fito(fpath)
                 fi['_mtime'] = file_mtime(fpath)
                 fitos.append(fi)
-            elif kind == 'MANIFIESTO':
+            elif 'FACTURA' in upper or 'INVOICE' in upper or 'PROFORMA' in upper:
+                fd = extract_factura(fpath)
+                fd['_mtime'] = file_mtime(fpath)
+                facturas.append(fd)
+            elif 'MANIFIESTO' in upper:
                 manifiestos.append({"number": extract_manifiesto(fpath), "_mtime": file_mtime(fpath)})
+            # si no matchea nada: se ignora (UNKNOWN)
     return facturas, fitos, manifiestos
 
 
@@ -363,26 +448,23 @@ def build_row(container, bl_data, bl_warning, facturas, fitos, manifiestos):
     if not bl_data:
         warnings.append(f"{container}: no se encontró BL para este contenedor")
 
-    # FACTURAS que mencionan este contenedor (directo o en bultos_per_container)
-    matched_facturas = [
-        f for f in facturas
-        if f.get("contenedor") == container or container in f.get("bultos_per_container", {})
-    ]
-    all_bultos_fact = {}
+    # FACTURAS cuyo listado de contenedores incluye este contenedor
+    # (una factura puede cubrir varios contenedores a la vez)
+    matched_facturas = [f for f in facturas if container in f.get("containers", [])]
     if matched_facturas:
         row["PROVEEDOR"] = matched_facturas[0]["proveedor"]
         row["ITEM"]      = matched_facturas[0]["item"]
         nums = [f["factura"] for f in matched_facturas if f["factura"] != "???"]
         row["FACTURA"] = " / ".join(dict.fromkeys(nums)) if nums else "???"
-        for fd in matched_facturas:
-            all_bultos_fact.update(fd.get("bultos_per_container", {}))
     else:
         warnings.append(f"{container}: no se encontró factura para este contenedor")
 
-    # FITOS de este contenedor
-    matched_fitos = [fi for fi in fitos if fi.get("contenedor") == container]
+    # FITOS cuyo listado de contenedores incluye este contenedor
+    matched_fitos = [fi for fi in fitos if container in fi.get("containers", [])]
     if matched_fitos:
-        row["FITO"] = " / ".join(fi["number"] for fi in matched_fitos)
+        row["FITO"] = " / ".join(dict.fromkeys(fi["number"] for fi in matched_fitos))
+        if row["ITEM"] == "???" and matched_fitos[0].get("item"):
+            row["ITEM"] = matched_fitos[0]["item"]
     else:
         warnings.append(f"{container}: no se encontró fito para este contenedor")
 
@@ -394,13 +476,17 @@ def build_row(container, bl_data, bl_warning, facturas, fitos, manifiestos):
         warnings.append(f"{container}: hay {len(manifiestos)} manifiestos distintos, "
                          f"se usó el primero — revisar manualmente")
 
-    # Validación bultos factura vs fito
-    bultos_fact = all_bultos_fact.get(container)
-    bultos_fito = next((fi["bultos"] for fi in matched_fitos), None)
-    if bultos_fact and bultos_fito and bultos_fact != bultos_fito:
-        warnings.append(
-            f"BULTOS NO CUADRAN en {container}: Factura={bultos_fact} Fito={bultos_fito}"
-        )
+    # Validación de bultos: el FITO es la referencia (una factura puede
+    # cubrir varios contenedores con un solo total combinado, así que solo
+    # se compara cuando hay exactamente 1 factura y 1 fito para este
+    # contenedor y ambos traen una cifra.
+    if len(matched_facturas) == 1 and len(matched_fitos) == 1:
+        bf  = matched_facturas[0].get("bultos")
+        bfi = matched_fitos[0].get("bultos")
+        if bf and bfi and bf != bfi:
+            warnings.append(
+                f"BULTOS NO CUADRAN en {container}: Factura={bf} Fito={bfi} (el fito es la referencia)"
+            )
 
     return row, warnings
 
@@ -485,7 +571,9 @@ COL_WIDTHS = {
 def generate_excel(rows, output_path, semana, marchamo_lookup=None):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"SEMANA {semana}"
+    # Excel prohíbe : \ / ? * [ ] en el nombre de hoja, y limita a 31 caracteres
+    safe_title = re.sub(r'[:\\/?*\[\]]', '-', f"SEMANA {semana}")[:31] or "SEMANA"
+    ws.title = safe_title
 
     # Título
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(HEADERS))
@@ -607,12 +695,9 @@ def run_extraction(input_folder, output_path, semana="?", bl_file=None, marchamo
     # ── Universo de contenedores: BL ∪ facturas ∪ fitos ──
     all_containers = set(bl_by_container.keys())
     for f in facturas:
-        if f.get("contenedor") not in (None, "???"):
-            all_containers.add(f["contenedor"])
-        all_containers.update(k for k in f.get("bultos_per_container", {}) if k)
+        all_containers.update(f.get("containers", []))
     for fi in fitos:
-        if fi.get("contenedor"):
-            all_containers.add(fi["contenedor"])
+        all_containers.update(fi.get("containers", []))
 
     if not all_containers:
         raise ValueError("no se pudo determinar ningún contenedor a partir de los documentos")
