@@ -1,18 +1,28 @@
 """
-API OCR Dole — envuelve extract_dole_core.run_extraction() en un endpoint HTTP.
+API OCR Dole — expone el motor de extracción como endpoints HTTP para n8n.
 
-Dos formas de usarla desde n8n:
+Flujo pensado (Python nunca toca Drive ni arma el Excel — eso es trabajo
+de n8n):
 
-1) UN SOLO ARCHIVO POR LLAMADA (recomendado — así es como n8n ejecuta el
-   nodo HTTP Request de forma natural, una vez por cada ítem que le llega):
-   POST /upload      (uno por archivo)   → batch_id + file
-   POST /finalize     (una sola vez)     → batch_id + semana → devuelve el Excel
+1) POST /split-bl-pdf     → recibe el PDF combinado de ~100 BLs (1 correo,
+                             1 sola vez por semana). Devuelve, por cada BL:
+                             el PDF individual (base64) + los datos clave
+                             (gyeprq, contenedor, destino, tipo). Con esto
+                             n8n crea las carpetas en Drive y arranca el Excel.
 
-2) UNA SOLA LLAMADA CON TODO (requiere haber combinado los archivos en un
-   único ítem con varias propiedades binarias antes del HTTP Request):
-   POST /procesar     → files[] + semana → devuelve el Excel directamente
+2) POST /classify-document → recibe UN documento suelto (factura, fito,
+                             manifiesto o marchamos) — se llama una vez por
+                             archivo, a medida que van llegando en cada
+                             correo (el primero o los siguientes). Devuelve
+                             el tipo detectado + los campos extraídos, para
+                             que n8n actualice las filas correspondientes
+                             del Excel por contenedor.
 
-Headers en ambos casos: X-API-Key: <API_KEY>
+Endpoints heredados (all-in-one, arman el Excel completo del lado de
+Python): /procesar, /upload + /finalize. Se mantienen por si sirven para
+otro flujo, pero el flujo recomendado con n8n es el de arriba.
+
+Headers en todos los casos: X-API-Key: <API_KEY>
 """
 
 import os
@@ -20,12 +30,16 @@ import re
 import shutil
 import tempfile
 import time
+import base64
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
-from extract_dole_core import run_extraction, classify_file
+from extract_dole_core import (
+    run_extraction, classify_file,
+    split_bl_pdf_pages, classify_single_document,
+)
 
 API_KEY = os.environ.get("OCR_DOLE_API_KEY", "")  # define esto en el hosting (variable de entorno)
 
@@ -43,6 +57,83 @@ def check_api_key(x_api_key: Optional[str]):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/split-bl-pdf")
+async def split_bl_pdf_endpoint(
+    file: UploadFile = File(..., description="El PDF combinado de BLs (1 pagina = 1 BL, ej. ~100 paginas)"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Divide el PDF de N hojas y devuelve, por cada pagina/BL:
+    gyeprq, contenedor, destino, tipo, filename y el PDF de esa sola
+    pagina en base64. No escribe nada a disco de forma persistente ni
+    toca Drive — n8n decide que hacer con cada resultado (crear carpeta,
+    subir el PDF, escribir la fila en el Excel).
+    """
+    check_api_key(x_api_key)
+    content = await file.read()
+
+    try:
+        paginas = split_bl_pdf_pages(content)
+    except Exception as e:
+        return JSONResponse(status_code=422, content={"error": f"No se pudo procesar el PDF: {e}"})
+
+    bls = []
+    advertencias = []
+    for p in paginas:
+        if p["warning"]:
+            advertencias.append(p["warning"])
+        for campo in ("gyeprq", "contenedor", "destino", "tipo"):
+            if p[campo] == "???":
+                advertencias.append(f"pagina {p['pagina']}: no se encontro {campo}")
+
+        nombre_base = p["gyeprq"] if p["gyeprq"] != "???" else f"SIN_CODIGO_pagina_{p['pagina']}"
+        bls.append({
+            "gyeprq": p["gyeprq"],
+            "contenedor": p["contenedor"],
+            "destino": p["destino"],
+            "tipo": p["tipo"],
+            "filename": f"{nombre_base}.pdf",
+            "pdf_base64": base64.b64encode(p["pdf_bytes"]).decode("ascii"),
+        })
+
+    return {
+        "total_paginas": len(bls),
+        "bls": bls,
+        "advertencias": advertencias,
+    }
+
+
+@app.post("/classify-document")
+async def classify_document_endpoint(
+    file: UploadFile = File(..., description="Un documento suelto: factura, fito, manifiesto o marchamos"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Clasifica y extrae los datos de UN documento suelto (sin necesitar el
+    resto de la semana). Pensado para llamarse una vez por archivo segun
+    van llegando en cada correo. n8n usa el "tipo" devuelto para decidir
+    como actualizar el Excel (por contenedor, o el manifiesto/marchamos
+    que aplica a toda la semana).
+    """
+    check_api_key(x_api_key)
+    content = await file.read()
+    if len(content) == 0:
+        return {"tipo": "DESCONOCIDO", "motivo": "archivo vacio"}
+
+    tmp_path = os.path.join(tempfile.mkdtemp(prefix="ocr_dole_doc_"), file.filename)
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+
+    try:
+        resultado = classify_single_document(tmp_path)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Error inesperado: {e}"})
+    finally:
+        shutil.rmtree(os.path.dirname(tmp_path), ignore_errors=True)
+
+    return resultado
 
 
 def _batch_dir(batch_id: str) -> str:

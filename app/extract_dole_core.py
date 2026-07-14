@@ -102,7 +102,7 @@ def pdf_text(path):
 
 
 def xlsx_text(path):
-    """Convierte todas las celdas de un xlsx a texto plano, para poder
+    """Convierte todas las celdas de un xlsx/xlsm a texto plano, para poder
     aplicarle las mismas búsquedas por palabra clave/regex que a un PDF."""
     try:
         wb = openpyxl.load_workbook(path, data_only=True)
@@ -117,9 +117,35 @@ def xlsx_text(path):
     return "\n".join(lines)
 
 
+def xls_legacy_text(path):
+    """Convierte un .xls VIEJO (formato binario, no XML) a texto plano.
+    openpyxl NO puede leer este formato — en la práctica, las facturas de
+    UBESA llegan exactamente así (ej. 'ECFPOFACTURA QUETZAL - DAC609-
+    INV6750.xls'), y con openpyxl ese archivo se leería como texto vacío,
+    perdiendo silenciosamente la factura completa. Se usa xlrd en su lugar."""
+    try:
+        import xlrd
+    except ImportError:
+        return ""
+    try:
+        wb = xlrd.open_workbook(path)
+    except Exception:
+        return ""
+    lines = []
+    for sheet_idx in range(wb.nsheets):
+        sh = wb.sheet_by_index(sheet_idx)
+        for r in range(sh.nrows):
+            for cell in sh.row_values(r):
+                if cell not in (None, ""):
+                    lines.append(str(cell))
+    return "\n".join(lines)
+
+
 def doc_text(path):
     ext = os.path.splitext(path)[1].lower()
-    if ext in ('.xlsx', '.xlsm', '.xls'):
+    if ext == '.xls':
+        return xls_legacy_text(path)
+    if ext in ('.xlsx', '.xlsm'):
         return xlsx_text(path)
     return pdf_text(path)
 
@@ -293,14 +319,24 @@ def _extract_bultos_total(text):
     return None
 
 
-def _extract_proveedor_from_path(path):
-    """El nombre del proveedor sale de la carpeta que contiene el archivo
-    (ej. .../OTROS EXPORTADORES/LUDERSON/archivo.pdf → LUDERSON), excepto
-    para UBESA, donde los archivos viven en subcarpetas por destino
-    (FPO/GPT/ILG) dentro de una carpeta UBESA — en ese caso se usa "UBESA"."""
+def _extract_proveedor_from_path(path, text=""):
+    """El proveedor se detecta primero por CONTENIDO (más confiable: las
+    facturas UBESA a veces llegan sueltas, sin ninguna subcarpeta "UBESA/"
+    que las identifique — ej. el correo con "ECFPOFACTURA...INV6750.xls"
+    directo en la raíz). Si el contenido no lo delata, se cae a la carpeta
+    contenedora (ej. .../OTROS EXPORTADORES/LUDERSON/archivo.pdf → LUDERSON)."""
+    upper_text = text.upper()
+    if 'UNION DE BANANEROS ECUATORIANOS' in upper_text or 'UBESA' in upper_text:
+        return 'UBESA'
+
     parts = [p.upper() for p in os.path.normpath(path).split(os.sep)]
     if 'UBESA' in parts:
         return 'UBESA'
+    # También suele venir en el propio nombre de archivo (ej. "ECFPOFACTURA...")
+    fname_upper = os.path.basename(path).upper()
+    if fname_upper.startswith('EC') and 'FACTURA' in fname_upper:
+        return 'UBESA'
+
     parent = os.path.basename(os.path.dirname(path)).upper().strip()
     if parent and 'OTROS EXPORTADORES' not in parent:
         return parent
@@ -335,7 +371,7 @@ def extract_factura(path):
     text = doc_text(path)
     upper = text.upper()
 
-    proveedor = _extract_proveedor_from_path(path)
+    proveedor = _extract_proveedor_from_path(path, text)
 
     # Número de factura: formato estándar Ecuador (001-002-000000123456),
     # luego "FACT #1234" / "FACT 1234", luego "No. 123456789..." genérico
@@ -493,6 +529,92 @@ def build_row(container, bl_data, bl_warning, facturas, fitos, manifiestos):
 # ─────────────────────────────────────────────
 # LISTADO DE MARCHAMOS
 # ─────────────────────────────────────────────
+
+def split_bl_pdf_pages(pdf_bytes):
+    """
+    Version 'API' de split_bl_pdf(): en vez de leer de una ruta y devolver
+    solo texto por código, recibe los BYTES del PDF combinado y devuelve,
+    por cada página, el PDF de una sola página (bytes) + los datos ya
+    extraídos con extract_bl_from_text (misma lógica ya validada).
+
+    Retorna: list of {"gyeprq", "contenedor", "destino", "tipo",
+                       "warning", "pdf_bytes"}
+    """
+    import io
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    resultados = []
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            m = re.search(r'\b(GYEPRQ\d+)\b', text, re.IGNORECASE)
+            code = m.group(1).upper() if m else None
+
+            bl_data, warning = extract_bl_from_text(text, code)
+
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            writer.write(buf)
+
+            resultados.append({
+                "gyeprq": bl_data["BL"],
+                "contenedor": bl_data["CONTENEDOR"],
+                "destino": bl_data["DESTINO"],
+                "tipo": bl_data["TIPO"],
+                "pagina": i + 1,
+                "warning": warning,
+                "pdf_bytes": buf.getvalue(),
+            })
+    return resultados
+
+
+def classify_single_document(path):
+    """
+    Clasifica y extrae UN documento suelto (factura, fito, manifiesto o
+    marchamos) sin necesitar el resto de la semana — pensado para el
+    endpoint /classify-document, que se llama una vez por archivo a medida
+    que van llegando en cada correo.
+
+    Retorna: {"tipo": "FACTURA"|"FITO"|"MANIFIESTO"|"MARCHAMOS"|"DESCONOCIDO",
+              ...campos propios de ese tipo...}
+    """
+    fname_upper = os.path.basename(path).upper()
+    ext = os.path.splitext(path)[1].lower()
+
+    if 'CONSULTAMANIFIESTO' in fname_upper or ('CONSULTA' in fname_upper and 'MANIFIESTO' in fname_upper):
+        numero = extract_manifiesto(path)
+        text = pdf_text(path)
+        codigos = sorted(set(re.findall(r'GYEPRQ\d+', text)))
+        return {"tipo": "MANIFIESTO", "numero": numero, "gyeprq_cubiertos": codigos}
+
+    if ext in ('.xlsx', '.xlsm') and 'MARCHAMO' in fname_upper:
+        lookup = load_marchamo_lookup(path)
+        return {"tipo": "MARCHAMOS", "contenedor_a_marchamo": lookup}
+
+    if ext not in ('.pdf', '.xlsx', '.xlsm', '.xls'):
+        return {"tipo": "DESCONOCIDO", "motivo": f"extensión no soportada: {ext}"}
+
+    text = doc_text(path)
+    upper = text.upper()
+
+    if 'FITOSANITARIO' in upper or 'PHYTOSANITARY' in upper:
+        fi = extract_fito(path)
+        return {"tipo": "FITO", **fi}
+
+    if 'FACTURA' in upper or 'INVOICE' in upper or 'PROFORMA' in upper:
+        fd = extract_factura(path)
+        return {"tipo": "FACTURA", **fd}
+
+    if 'MANIFIESTO' in upper:
+        numero = extract_manifiesto(path)
+        codigos = sorted(set(re.findall(r'GYEPRQ\d+', text)))
+        return {"tipo": "MANIFIESTO", "numero": numero, "gyeprq_cubiertos": codigos}
+
+    return {"tipo": "DESCONOCIDO", "motivo": "no se encontraron palabras clave (FACTURA/FITOSANITARIO/MANIFIESTO)"}
+
 
 def load_marchamo_lookup(marchamo_file):
     """CONTENEDOR → 'SAT-GT-{numero}'"""
