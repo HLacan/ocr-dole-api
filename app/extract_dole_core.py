@@ -616,6 +616,45 @@ def classify_single_document(path):
     return {"tipo": "DESCONOCIDO", "motivo": "no se encontraron palabras clave (FACTURA/FITOSANITARIO/MANIFIESTO)"}
 
 
+EXTENSIONES_VALIDAS = ('.pdf', '.xls', '.xlsx', '.xlsm')
+
+
+def flatten_zip_bytes(filename, content):
+    """
+    Aplana recursivamente un archivo que puede ser un zip (con zips
+    anidados adentro, a cualquier profundidad) usando la libreria estandar
+    'zipfile' -- no hay restricciones de modulos aqui como en n8n.
+
+    Si 'filename' no es un zip, simplemente lo devuelve tal cual (siempre
+    que su extension nos interese). Descarta automaticamente las entradas
+    de carpeta y cualquier archivo con extension que no nos sirva.
+
+    Retorna: list of {"filename": str, "content": bytes}
+    """
+    import zipfile
+    import io
+
+    resultados = []
+
+    def _flatten(nombre, datos):
+        if nombre.lower().endswith('.zip'):
+            with zipfile.ZipFile(io.BytesIO(datos)) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    nombre_interno = info.filename.split('/')[-1]
+                    if not nombre_interno:
+                        continue
+                    _flatten(nombre_interno, zf.read(info))
+        else:
+            ext = os.path.splitext(nombre)[1].lower()
+            if ext in EXTENSIONES_VALIDAS:
+                resultados.append({"filename": nombre, "content": datos})
+
+    _flatten(filename, content)
+    return resultados
+
+
 def load_marchamo_lookup(marchamo_file):
     """CONTENEDOR → 'SAT-GT-{numero}'"""
     lookup = {}

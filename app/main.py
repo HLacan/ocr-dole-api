@@ -39,6 +39,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from extract_dole_core import (
     run_extraction, classify_file,
     split_bl_pdf_pages, classify_single_document,
+    flatten_zip_bytes,
 )
 
 API_KEY = os.environ.get("OCR_DOLE_API_KEY", "")  # define esto en el hosting (variable de entorno)
@@ -57,6 +58,39 @@ def check_api_key(x_api_key: Optional[str]):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/flatten-attachment")
+async def flatten_attachment_endpoint(
+    file: UploadFile = File(..., description="El adjunto del correo -- puede ser un zip (con zips anidados adentro) o un archivo suelto"),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Reemplaza TODO el tramo de descompresion que antes vivia en n8n
+    (Compression x2, IF "es zip anidado", Code "separar binarios",
+    sub-workflow recursivo). Recibe el adjunto tal cual, y devuelve la
+    lista PLANA de archivos reales que contiene, sin importar cuantos
+    niveles de zip haya adentro. Ya viene filtrado (sin carpetas, sin
+    extensiones que no nos sirven).
+    """
+    check_api_key(x_api_key)
+    content = await file.read()
+
+    try:
+        archivos = flatten_zip_bytes(file.filename, content)
+    except Exception as e:
+        return JSONResponse(status_code=422, content={"error": f"No se pudo procesar el archivo: {e}"})
+
+    return {
+        "total_archivos": len(archivos),
+        "archivos": [
+            {
+                "filename": a["filename"],
+                "content_base64": base64.b64encode(a["content"]).decode("ascii"),
+            }
+            for a in archivos
+        ],
+    }
 
 
 @app.post("/split-bl-pdf")
